@@ -1,0 +1,126 @@
+syntax = "proto3";
+
+package aes.baremetal.v1;
+
+// BareMetalService is the customer-facing API for whole-host leases. Distinct from
+// ComputeService (which serves KubeVirt VMs) because the lifecycle is different: no live
+// migration, no resize, the customer typically PXE-installs their own OS, and the lease is
+// pinned to a specific physical host until released.
+//
+// Flow: customer calls CreateBareMetalInstance(sku, datacenter); Metalhost picks a host with
+// matching aes.metalhost/bm-sku-class label whose role='baremetal_pool', flips its role to
+// 'baremetal_leased', and returns access info (Redfish endpoint for OS install). Customer
+// installs their OS via Tinkerbell or directly via the BMC. ReleaseBareMetalInstance flips
+// the host back to 'baremetal_pool'.
+service BareMetalService {
+  rpc CreateBareMetalInstance(CreateBareMetalInstanceRequest) returns (CreateBareMetalInstanceResponse);
+  rpc GetBareMetalInstance(GetBareMetalInstanceRequest) returns (GetBareMetalInstanceResponse);
+  rpc ListBareMetalInstances(ListBareMetalInstancesRequest) returns (ListBareMetalInstancesResponse);
+  // ReleaseBareMetalInstance ends the lease; the host's role returns to 'baremetal_pool'. The
+  // customer's data on local disks is not wiped by Metalhost — operator policy decides whether
+  // the host is reformatted before re-leasing.
+  rpc ReleaseBareMetalInstance(ReleaseBareMetalInstanceRequest) returns (ReleaseBareMetalInstanceResponse);
+  // GetBareMetalConsoleURL returns a short-lived URL for serial-over-LAN access via the BMC.
+  // Backed by Redfish SerialConsole; expires after 1h.
+  rpc GetBareMetalConsoleURL(GetBareMetalConsoleURLRequest) returns (GetBareMetalConsoleURLResponse);
+
+  // EnterRescueMode boots the host into a rescue image via Redfish one-time boot override
+  // followed by a power cycle. The rescue image URL is the operator's responsibility (set
+  // via METALHOST_BM_RESCUE_IMAGE_URL or per-DC annotation `aes.metalhost/bm-rescue-image-url`).
+  // The instance's spec.rescue_mode flag is set so subsequent reads / future workers know
+  // the host is in rescue. ExitRescueMode reverses this — clears the boot override and
+  // power-cycles back to the normal disk boot order.
+  rpc EnterBareMetalRescueMode(EnterBareMetalRescueModeRequest) returns (EnterBareMetalRescueModeResponse);
+  rpc ExitBareMetalRescueMode(ExitBareMetalRescueModeRequest) returns (ExitBareMetalRescueModeResponse);
+}
+
+message BareMetalInstance {
+  // Resource name `bare-metal-instances/{slug}`.
+  string name = 1;
+  string project_name = 2;
+  string datacenter_name = 3;
+  // SKU class (e.g. skus/bm.dell-r640.dual-6248r-384gib). Drives billing.
+  string instance_type = 4;
+  // Host bound to this lease (`hosts/{slug}`). Set when state=ACTIVE; empty when CREATING.
+  string host_name = 5;
+  // PROVISIONING / ACTIVE / RELEASING / RELEASED.
+  string state = 6;
+  // Redfish endpoint forwarded from the host record. Customer uses this to BMC-control the box
+  // (PXE install, power cycle, console). Empty when the host has no Redfish configured.
+  string redfish_endpoint = 7;
+  int64 create_time_unix = 8;
+  int64 update_time_unix = 9;
+  map<string, string> labels = 10;
+  map<string, string> annotations = 11;
+}
+
+message CreateBareMetalInstanceRequest {
+  // Resource name `bare-metal-instances/{slug}`. Slug must be DNS-safe.
+  string name = 1;
+  string project_name = 2;
+  string datacenter_name = 3;
+  string instance_type = 4;
+  map<string, string> labels = 5;
+  map<string, string> annotations = 6;
+  string idempotency_key = 7;
+}
+
+message CreateBareMetalInstanceResponse {
+  BareMetalInstance instance = 1;
+}
+
+message GetBareMetalInstanceRequest {
+  string name = 1;
+}
+
+message GetBareMetalInstanceResponse {
+  BareMetalInstance instance = 1;
+}
+
+message ListBareMetalInstancesRequest {
+  // Required for non-admin callers (project-scoped). Same scoping pattern as audit/ops.
+  string project_name = 1;
+  int32 page_size = 2;
+  string page_token = 3;
+}
+
+message ListBareMetalInstancesResponse {
+  repeated BareMetalInstance bare_metal_instances = 1;
+  string next_page_token = 2;
+}
+
+message ReleaseBareMetalInstanceRequest {
+  string name = 1;
+  string idempotency_key = 2;
+}
+
+message ReleaseBareMetalInstanceResponse {}
+
+message GetBareMetalConsoleURLRequest {
+  string name = 1;
+}
+
+message GetBareMetalConsoleURLResponse {
+  // Short-lived URL (expires after 1h). Token-bearer; no further auth required to connect.
+  string console_url = 1;
+  int64 expires_at_unix = 2;
+}
+
+message EnterBareMetalRescueModeRequest {
+  string name = 1;
+  // Optional explicit rescue image URL override; defaults to the per-DC annotation or
+  // METALHOST_BM_RESCUE_IMAGE_URL. Useful for distro-specific rescue tooling.
+  string rescue_image_url = 2;
+}
+
+message EnterBareMetalRescueModeResponse {
+  BareMetalInstance instance = 1;
+}
+
+message ExitBareMetalRescueModeRequest {
+  string name = 1;
+}
+
+message ExitBareMetalRescueModeResponse {
+  BareMetalInstance instance = 1;
+}

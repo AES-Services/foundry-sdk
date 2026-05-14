@@ -1,0 +1,184 @@
+syntax = "proto3";
+
+package aes.ops.v1;
+
+// Long-running async work unit (GCP Long-Operation style). Mutations return
+// a name like `operations/op_abc123`; clients poll GetOperation until terminal state.
+//
+// Customer-facing surface is read-only: Get + List. Operation creation is server-side
+// only — kicked off by other services (CreateVM, ProvisionDatacenter, etc.) when they
+// need to track a long-running activity. Cancellation isn't exposed to customers:
+// proper mid-flight rollback requires per-workflow cleanup logic (e.g., release public
+// IPs, refund wallet, soft-delete VM row), and Temporal cancellation alone doesn't
+// guarantee that. The CreateOperation message + handler still exist as backend
+// machinery — see services/ops/server.go — they're just not routed as an RPC.
+service OperationsService {
+  rpc GetOperation(GetOperationRequest) returns (GetOperationResponse);
+  // Lists operations in name order (opaque page_token is the last-seen name).
+  rpc ListOperations(ListOperationsRequest) returns (ListOperationsResponse);
+}
+
+message CreateOperationRequest {
+  // Workflow or API kind for audit, e.g. `noop`, `datacenter_provision`, `vm_provision`, `vm_delete`, `host_provision`.
+  string kind = 1;
+  // When kind is `datacenter_provision` or `datacenter_tier1`: datacenter resource name (`datacenters/...`).
+  string datacenter_name = 2;
+  // When kind is `vm_provision`, required: VM placement and SKU (see ComputeService.CreateVirtualMachine).
+  string vm_project_name = 3;
+  string vm_datacenter_name = 4;
+  string vm_instance_type = 5;
+  // When kind is `vm_delete`, required: VM resource name to destroy.
+  string vm_name = 6;
+  // When kind is `host_provision`, required: inventory host (`hosts/...`) to join as a worker
+  // and the target datacenter the host should join. The host must already be registered in
+  // inventory with SSH metadata; the workflow handles node-prep + kubeadm join + label apply.
+  string host_name = 7;
+  // Reserved — was the legacy multi-network list. Replaced by `vm_network_name`
+  // (field 21) below.
+  reserved 8, 9, 10;
+  reserved "vm_network_names", "vm_disk_size_gib", "vm_boot_image_url";
+  // Optional SSH public key for cloud-init injection. Empty = no inbound SSH on the VM.
+  string vm_ssh_pubkey = 11;
+  // Optional raw cloud-config userdata (full `#cloud-config` document). Supersedes ssh_pubkey
+  // when both are set.
+  string vm_user_data = 12;
+  // Billing intent for vm_provision. Customer is charged at API-edge BEFORE the workflow
+  // starts (per the prepaid-on-create model); these fields snapshot the charge so the
+  // workflow can write the vm_reservations row + flip compute_instances columns after VM
+  // insertion without re-querying meter rates (which could have changed since the API call).
+  // Empty vm_billing_mode = HOURLY (no upfront charge happened).
+  string vm_billing_mode = 13;          // "HOURLY" | "MONTHLY_1" | "MONTHLY_3" | "MONTHLY_6" | "MONTHLY_12"
+  bool vm_autorenew = 14;
+  int64 vm_prepaid_amount_minor = 15;
+  int64 vm_hourly_rate_minor = 16;
+  // Journal entry id from the wallet's ChargeVMReservation call. Workflow links the
+  // vm_reservations row to this journal so cancellation/refund flows can locate it.
+  string vm_prepay_journal_entry_id = 17;
+  // Term-end timestamp computed at charge time. Workflow writes this to
+  // compute_instances.commitment_end_at and vm_reservations.end_at exactly.
+  int64 vm_commitment_end_at_unix = 18;
+  // Wallet + billing account snapshots so the workflow doesn't have to re-resolve them.
+  string vm_wallet_name = 19;
+  string vm_billing_account_name = 20;
+  // Single-NIC redesign: tenant Network the VM attaches to (resource name). Resolved at
+  // CreateVM API edge (default-network ensure runs there); workflow uses it to derive the
+  // k8s namespace + UDN attachment.
+  string vm_network_name = 21;
+  // K8s namespace the VM CR + virt-launcher pod should be created in. Equals
+  // `net-<network-id>` for the resolved Network. Workflow does NOT auto-create the namespace
+  // — it must already exist (network reconciler ensures it on Network create).
+  string vm_namespace = 22;
+  // User-facing hostname (DNS-1123 label, ≤63 chars). Used as the VM's k8s object name +
+  // cloud-init set_hostname. When empty, the workflow falls back to the VM's resource id
+  // slug.
+  string vm_hostname = 23;
+  // Allocate a public IPv4 from the DC's pool for the VM public NIC workflow. Default false;
+  // v6 is always reachable from the network's /64 without burning a public v4.
+  bool vm_assign_public_ipv4 = 24;
+  // User-facing labels stamped at create time. Workflow writes them into compute_instances.spec
+  // so GetVM/ListVMs surface them. Same merge semantics as UpdateVirtualMachineRequest.labels
+  // for later mutations.
+  map<string, string> vm_labels = 25;
+  // Operator notes / non-indexed metadata. Same shape as labels.
+  map<string, string> vm_annotations = 26;
+  // Pre-resolved boot disk for vm_provision (`projects/{p}/disks/{id}`). The compute API edge
+  // resolves boot_disk_name (existing) or BootDiskSpec (inline create + hydration wait) to a
+  // concrete Disk before kicking the workflow. Workflow's CreateKubeVirtVM references the disk's
+  // PVC directly via persistentVolumeClaim.claimName. Empty = ephemeral containerDisk fallback
+  // (lab/CI only). The boot disk is owned by the project, not the VM — DeleteVirtualMachine
+  // detaches it but does not delete it.
+  string vm_boot_disk_name = 27;
+  // Removed when the configurator landed: hard non-cancel makes early-cancel + later-reuse
+  // structurally impossible, so the REUSABLE-credit field has no callers.
+  reserved 28;
+  reserved "vm_reuse_existing_term_id";
+  // Configurator shape stamped onto the operation so the workflow's vm-insert activity
+  // writes the same vcpus / ram_gib / cpu_class onto compute_instances. Replaces the old
+  // implicit "instance_type → SKU lookup" path. See services/pricing.Shape.
+  int32 vm_vcpus = 29;
+  int32 vm_ram_gib = 30;
+  string vm_cpu_class = 31;
+  // Inline boot-disk spec for vm_provision. When set (and vm_boot_disk_name is empty),
+  // the workflow's HydrateInlineBootDisk activity calls Storage.CreateDisk + polls for
+  // AVAILABLE before VM creation proceeds. Replaces the prior synchronous-at-API-edge
+  // pattern that blocked the HTTP call for the entire image-pull window (#120). Mirrors
+  // compute.v1.BootDiskSpec field-for-field.
+  int32 vm_boot_disk_size_gib = 32;
+  string vm_boot_disk_from_image_url = 33;
+  string vm_boot_disk_from_image_name = 34;
+  reserved 35;
+  reserved "vm_boot_disk_from_snapshot";
+  string vm_boot_disk_storage_class = 36;
+  string vm_boot_disk_display_name = 37;
+}
+
+message CreateOperationResponse {
+  Operation operation = 1;
+}
+
+message GetOperationRequest {
+  // Resource name, e.g. `operations/{operation_id}`.
+  string name = 1;
+}
+
+message GetOperationResponse {
+  Operation operation = 1;
+}
+
+message ListOperationsRequest {
+  // Default 50; max 100.
+  int32 page_size = 1;
+  // Opaque cursor from a prior ListOperationsResponse.next_page_token.
+  string page_token = 2;
+  // Required for non-admin callers: filters to ops whose metadata.vm_project_name (or related
+  // project key) matches. Admin (admin.platform) callers may omit to see all ops fleet-wide.
+  // Resource name like `projects/metalhost-demo`.
+  string project_name = 3;
+}
+
+message ListOperationsResponse {
+  repeated Operation operations = 1;
+  string next_page_token = 2;
+}
+
+message CancelOperationRequest {
+  string name = 1;
+}
+
+message CancelOperationResponse {
+  Operation operation = 1;
+}
+
+message WatchOperationRequest {
+  // Operation resource name (`operations/{id}`).
+  string name = 1;
+}
+
+message WatchOperationResponse {
+  Operation operation = 1;
+}
+
+enum State {
+  STATE_UNSPECIFIED = 0;
+  STATE_PENDING = 1;
+  STATE_RUNNING = 2;
+  STATE_SUCCEEDED = 3;
+  STATE_FAILED = 4;
+  STATE_CANCELLED = 5;
+}
+
+message Operation {
+  string name = 1;
+  State state = 2;
+  int64 create_time_unix = 3;
+  int64 update_time_unix = 4;
+  // Set when state == STATE_FAILED; optional detail later via google.rpc.Status.
+  string error_message = 5;
+  // Same as CreateOperationRequest.kind; immutable after create.
+  string kind = 6;
+  // Populated after a Temporal workflow is started for this operation (if any).
+  string temporal_workflow_id = 7;
+  string temporal_run_id = 8;
+  // Opaque key/value (e.g. vm_project_name on create; virtual_machine_name when provision completes).
+  map<string, string> metadata = 9;
+}

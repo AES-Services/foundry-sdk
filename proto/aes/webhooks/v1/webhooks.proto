@@ -1,0 +1,114 @@
+syntax = "proto3";
+
+package aes.webhooks.v1;
+
+// WebhooksService manages customer-defined HTTP callbacks for resource events. Customers
+// register endpoint URLs + the event types they care about; metalhostd's outbox worker delivers
+// matching events as POSTs with HMAC-SHA256 signatures (X-Metalhost-Signature header) using a
+// per-subscription shared secret returned at create time.
+//
+// Event types follow the convention `{domain}.{resource}.{verb}` —
+//   compute.vm.created / compute.vm.deleted / compute.vm.state_changed
+//   storage.disk.created / storage.disk.deleted
+//   ops.operation.completed
+//   billing.invoice.finalized
+// Customers subscribe to specific types or use a wildcard prefix (e.g. "compute.vm.*").
+service WebhooksService {
+  rpc CreateSubscription(CreateSubscriptionRequest) returns (CreateSubscriptionResponse);
+  rpc GetSubscription(GetSubscriptionRequest) returns (GetSubscriptionResponse);
+  rpc ListSubscriptions(ListSubscriptionsRequest) returns (ListSubscriptionsResponse);
+  rpc UpdateSubscription(UpdateSubscriptionRequest) returns (UpdateSubscriptionResponse);
+  rpc DeleteSubscription(DeleteSubscriptionRequest) returns (DeleteSubscriptionResponse);
+  // ListDeliveries shows recent attempts for a subscription — status code, response body
+  // snippet, retry count. Bounded ring (last 100 per subscription).
+  rpc ListDeliveries(ListDeliveriesRequest) returns (ListDeliveriesResponse);
+}
+
+message Subscription {
+  // Resource name `webhook-subscriptions/{slug}`.
+  string name = 1;
+  string project_name = 2;
+  // HTTPS endpoint the worker POSTs events to. HTTP allowed in dev but rejected in prod
+  // (gateway can enforce).
+  string endpoint_url = 3;
+  // Event type prefixes the subscription matches. Empty list = subscribe to nothing (effectively
+  // disabled). Wildcards via trailing `.*`.
+  repeated string event_types = 4;
+  // ACTIVE / PAUSED.
+  string state = 5;
+  int64 create_time_unix = 6;
+  int64 update_time_unix = 7;
+  // Per-subscription identifier returned via the X-Metalhost-Subscription header in deliveries.
+  string secret_prefix = 8;
+}
+
+message CreateSubscriptionRequest {
+  string name = 1;
+  string project_name = 2;
+  string endpoint_url = 3;
+  repeated string event_types = 4;
+}
+
+message CreateSubscriptionResponse {
+  Subscription subscription = 1;
+  // The shared secret used for HMAC signing. Returned ONCE; never retrievable again. Store it.
+  string secret = 2;
+}
+
+message GetSubscriptionRequest { string name = 1; }
+message GetSubscriptionResponse { Subscription subscription = 1; }
+
+message ListSubscriptionsRequest {
+  string project_name = 1;
+  int32 page_size = 2;
+  string page_token = 3;
+}
+
+message ListSubscriptionsResponse {
+  repeated Subscription subscriptions = 1;
+  string next_page_token = 2;
+}
+
+message UpdateSubscriptionRequest {
+  string name = 1;
+  optional string endpoint_url = 2;
+  // When set, replaces event_types entirely.
+  repeated string event_types = 3;
+  bool replace_event_types = 4;
+  optional string state = 5;
+}
+
+message UpdateSubscriptionResponse { Subscription subscription = 1; }
+
+message DeleteSubscriptionRequest { string name = 1; }
+message DeleteSubscriptionResponse {}
+
+message Delivery {
+  string id = 1;
+  string subscription_name = 2;
+  string event_type = 3;
+  int64 dispatch_time_unix = 4;
+  int32 status_code = 5;
+  // Trailing 256 bytes of the endpoint's response body. Empty when delivery hasn't completed.
+  string response_snippet = 6;
+  int32 attempt_count = 7;
+  // ISO time when the next retry is scheduled (empty if delivered or out of retries).
+  int64 next_retry_unix = 8;
+  // pending | delivered | failed. Mirrors the webhook_deliveries.state column so callers can
+  // tell from ListDeliveries whether a delivery is in-flight, terminally failed (max retries
+  // exhausted), or succeeded.
+  string state = 9;
+  // Unix seconds when the delivery actually succeeded; 0 while pending or failed.
+  int64 delivered_at_unix = 10;
+}
+
+message ListDeliveriesRequest {
+  string subscription_name = 1;
+  int32 page_size = 2;
+  string page_token = 3;
+}
+
+message ListDeliveriesResponse {
+  repeated Delivery deliveries = 1;
+  string next_page_token = 2;
+}

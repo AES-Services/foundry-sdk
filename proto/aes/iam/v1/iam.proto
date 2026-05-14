@@ -1,0 +1,801 @@
+syntax = "proto3";
+
+package aes.iam.v1;
+
+// IamService holds identity primitives (design §4 iam-svc).
+//
+// Customer-facing surface intentionally excludes:
+//   - ValidateApiKey, ValidateOidcToken — internal-only (the HTTP auth middleware uses
+//     pkg-private Go helpers `ValidateAPIKeyRaw` / `validateOidcTokenRaw`); exposing the
+//     RPCs would let external callers test arbitrary key/token validity, a real enum vector.
+//   - CheckPermission — pre-flight per-button perm checks aren't worth wiring; UI lets
+//     the action fail with PermissionDenied at request time.
+//   - GetAuthMetadata — exposes which auth providers are configured; only matters for
+//     self-hosts without OIDC, which we don't ship.
+//   - GetOrgMember — single-getter ripped per platform pattern; ListOrgMembers covers it.
+//
+// The Go methods for these stay callable internally where needed.
+service IamService {
+  // GetCallerIdentity returns the principal, default project, and project scope (if any) of
+  // the calling key/token. Useful for clients (CLI / web) that want to display "logged in as"
+  // without re-deriving from the bearer token.
+  rpc GetCallerIdentity(GetCallerIdentityRequest) returns (GetCallerIdentityResponse);
+  // CreateApiKey mints a new API key for the calling principal. The secret is returned ONCE and
+  // never persisted in plaintext — store it immediately. The key inherits the caller's principal
+  // and a chosen default_project (the caller must have access to it).
+  rpc CreateApiKey(CreateApiKeyRequest) returns (CreateApiKeyResponse);
+  // ListApiKeys lists keys owned by the calling principal. Returns metadata (display name, prefix,
+  // create/expires/revoked timestamps) — never the secret.
+  rpc ListApiKeys(ListApiKeysRequest) returns (ListApiKeysResponse);
+  // RevokeApiKey invalidates a key the caller owns. Idempotent on already-revoked keys.
+  rpc RevokeApiKey(RevokeApiKeyRequest) returns (RevokeApiKeyResponse);
+  // SignUp self-provisions a new tenant: creates an organization, a default project, an IAM
+  // binding marking the caller as admin of their org, and a fresh API key. Public (no auth) —
+  // see docs/SIGNUP_PRODUCTION_HARDENING.md for the invite-gate / email-verification / OIDC
+  // path that has to land before exposing this through a public gateway.
+  rpc SignUp(SignUpRequest) returns (SignUpResponse);
+
+  // VerifyEmail consumes the token sent in the verification email + creates the user, org,
+  // default project, and initial API key. Returns the API key the CLI / web stores for
+  // subsequent calls.
+  rpc VerifyEmail(VerifyEmailRequest) returns (VerifyEmailResponse);
+
+  // Login authenticates an email/password pair and returns a session API key. For OIDC users
+  // (no password set), Login fails with FailedPrecondition; the caller should use the OIDC
+  // flow instead.
+  rpc Login(LoginRequest) returns (LoginResponse);
+
+  // LinkOidcProvider attaches an OIDC identity (Google / GitHub / etc.) to the calling user.
+  // After a successful link, that identity's CompleteOidcLogin will resolve to the same user.
+  // Returns the same authorize_url + state shape as StartOidcLogin; the linking is finalized
+  // when the caller's browser comes back through the standard CompleteOidcLogin path.
+  rpc LinkOidcProvider(LinkOidcProviderRequest) returns (LinkOidcProviderResponse);
+
+  // Org membership management. InviteOrgMember issues a one-time accept token (caller is the
+  // org admin); AcceptInvite is public (token-bearer) and creates the user + IAM binding when
+  // redeemed. ListOrgMembers / RemoveOrgMember close the loop on the membership lifecycle.
+  rpc InviteOrgMember(InviteOrgMemberRequest) returns (InviteOrgMemberResponse);
+  rpc AcceptInvite(AcceptInviteRequest) returns (AcceptInviteResponse);
+  // SetInitialPassword sets a password on an account that has none (typical: invite-accepted
+  // user who hasn't linked GitHub yet). Only allowed when password_hash is empty AND the
+  // caller has no OIDC identities — established accounts use ChangePassword instead. Caller
+  // must be authenticated (the AcceptInvite session token works).
+  rpc SetInitialPassword(SetInitialPasswordRequest) returns (SetInitialPasswordResponse);
+  rpc ListOrgMembers(ListOrgMembersRequest) returns (ListOrgMembersResponse);
+  rpc RemoveOrgMember(RemoveOrgMemberRequest) returns (RemoveOrgMemberResponse);
+  // UpdateOrgMemberRole swaps a member's role binding without forcing a remove+re-invite.
+  // Caller must hold admin.organization. Same role validation as InviteOrgMember.
+  rpc UpdateOrgMemberRole(UpdateOrgMemberRoleRequest) returns (UpdateOrgMemberRoleResponse);
+  // ListPendingInvites surfaces unaccepted invites for an org so admins can resend or revoke.
+  // Filters to PENDING + not-yet-expired. Caller must hold admin.organization.
+  rpc ListPendingInvites(ListPendingInvitesRequest) returns (ListPendingInvitesResponse);
+  // RevokeInvite marks a pending invite REVOKED so the token can't be accepted later.
+  // Idempotent on already-revoked rows. Caller must hold admin.organization.
+  rpc RevokeInvite(RevokeInviteRequest) returns (RevokeInviteResponse);
+
+  // RotateApiKey atomically issues a new key + revokes the old one in a single call. Use
+  // instead of revoke-then-create to avoid the window where neither key is valid.
+  rpc RotateApiKey(RotateApiKeyRequest) returns (RotateApiKeyResponse);
+
+  // OIDC customer login flow. StartOidcLogin returns the IdP authorize URL the customer's
+  // browser redirects to (with state + nonce). After the IdP redirects back to Metalhost's
+  // /oauth/callback, the gateway calls CompleteOidcLogin with the authorization code; we
+  // exchange it with the IdP, validate the ID token, find-or-create the user, and mint an
+  // API key for the session.
+  rpc StartOidcLogin(StartOidcLoginRequest) returns (StartOidcLoginResponse);
+  rpc CompleteOidcLogin(CompleteOidcLoginRequest) returns (CompleteOidcLoginResponse);
+
+  // MFA / TOTP. EnrollMFA returns a fresh shared secret + provisioning URI (otpauth://) the
+  // caller's authenticator app reads as a QR code; the credential starts in PENDING state and
+  // does nothing until VerifyMFAEnrollment confirms a valid TOTP code. ListMFADevices reports
+  // the principal's enrolled devices; RevokeMFADevice deactivates one. Recovery codes are
+  // issued on first verification (one-shot, hashed at rest) so a lost authenticator doesn't
+  // lock the user out — they're returned in VerifyMFAEnrollmentResponse.recovery_codes.
+  rpc EnrollMFA(EnrollMFARequest) returns (EnrollMFAResponse);
+  rpc VerifyMFAEnrollment(VerifyMFAEnrollmentRequest) returns (VerifyMFAEnrollmentResponse);
+  rpc ListMFADevices(ListMFADevicesRequest) returns (ListMFADevicesResponse);
+  rpc RevokeMFADevice(RevokeMFADeviceRequest) returns (RevokeMFADeviceResponse);
+
+  // Session management. Sessions are the metadata around interactive logins (OIDC, signup,
+  // invite-accept) — each one is linked to an API key. ListSessions shows the caller their
+  // active sessions; RevokeSession invalidates one (revokes the linked API key); RevokeAll
+  // revokes every session except the one calling (so users can "log out everywhere else"
+  // without locking themselves out). Programmatic API keys created via CreateApiKey are NOT
+  // sessions and don't appear here — they're managed via ListApiKeys / RevokeApiKey.
+  rpc ListSessions(ListSessionsRequest) returns (ListSessionsResponse);
+  rpc RevokeSession(RevokeSessionRequest) returns (RevokeSessionResponse);
+  rpc RevokeAllOtherSessions(RevokeAllOtherSessionsRequest) returns (RevokeAllOtherSessionsResponse);
+  // Logout revokes the calling session + its API key in one shot. Distinct from RevokeSession
+  // (which takes a session id) because the SPA's session cookie is HttpOnly — JS can't read
+  // the session id to pass into RevokeSession. The gateway clears the mh_session +
+  // mh_signed_in cookies on a successful response.
+  rpc Logout(LogoutRequest) returns (LogoutResponse);
+
+  // Password reset. RequestPasswordReset is anonymous — emits a token to the email IF it
+  // matches an active user, but always returns ok=true (no enumeration). ResetPassword
+  // consumes the token + sets a new bcrypt'd password + invalidates all the user's sessions
+  // (someone who triggered a reset should re-login from scratch on the trusted device).
+  rpc RequestPasswordReset(RequestPasswordResetRequest) returns (RequestPasswordResetResponse);
+  rpc ResetPassword(ResetPasswordRequest) returns (ResetPasswordResponse);
+
+  // Profile management. GetUser returns the user's display info (callable for any user the
+  // caller can read; passing an empty name returns the caller's own profile). UpdateUser
+  // changes mutable profile fields. ChangePassword rotates the bcrypt hash after verifying
+  // the current one. RequestEmailChange swaps users.email immediately and fires a heads-up
+  // to the previous address (the session itself is the auth — no second-leg confirmation).
+  rpc GetUser(GetUserRequest) returns (GetUserResponse);
+  rpc UpdateUser(UpdateUserRequest) returns (UpdateUserResponse);
+  rpc ChangePassword(ChangePasswordRequest) returns (ChangePasswordResponse);
+  rpc RequestEmailChange(RequestEmailChangeRequest) returns (RequestEmailChangeResponse);
+
+  // ImportGitHubSshKeys fetches the user's public SSH keys from GitHub's public endpoint
+  // (https://github.com/<username>.keys, no auth required) and bulk-creates SSHKey rows under
+  // the target project. Onboarding shortcut: the wizard offers "Import from GitHub" so users
+  // who signed up via the GitHub OAuth flow don't have to paste keys manually. Existing keys
+  // with the same fingerprint are skipped; only new keys are created. Returns the list of
+  // keys actually created (display_name, fingerprint) for UI feedback.
+  rpc ImportGitHubSshKeys(ImportGitHubSshKeysRequest) returns (ImportGitHubSshKeysResponse);
+
+  // ListNotifications returns customer-notable events for the bell-icon feed (top-up
+  // succeeded, VM op completed, spending alert triggered, etc.). Backed by audit_events
+  // filtered through the same notify_in_app classifier used by ListOrgActivity, joined to
+  // notification_reads so the caller knows what they've already seen. The 30-day window is
+  // enforced server-side. Use ListOrgActivity for the full audit log; this is the curated
+  // notification subset.
+  rpc ListNotifications(ListNotificationsRequest) returns (ListNotificationsResponse);
+  // MarkNotificationsRead upserts notification_reads rows so the bell badge count clears.
+  // Pass `mark_all=true` to mark every visible notification read; otherwise pass explicit
+  // event ids. Idempotent — re-marking an already-read row is a no-op.
+  rpc MarkNotificationsRead(MarkNotificationsReadRequest) returns (MarkNotificationsReadResponse);
+}
+
+message ValidateApiKeyRequest {
+  string raw_key = 1;
+}
+
+message ValidateApiKeyResponse {
+  // Stable principal id, e.g. `users/alice` or `serviceAccounts/bot`.
+  string principal = 1;
+  // Optional default project for this key (UX helper until full authz).
+  string default_project = 2;
+}
+
+message GetAuthMetadataRequest {}
+
+message GetAuthMetadataResponse {
+  bool supports_api_key = 1;
+  // OIDC issuer URL for interactive login (e.g. https://issuer.example.com). Empty if not configured.
+  string oidc_issuer_url = 2;
+  // Optional audience for OIDC tokens when enforced at the gateway.
+  string oidc_audience = 3;
+  // True when an issuer is configured (discovery / token validation may still be gateway-only in Phase 0).
+  bool supports_oidc = 4;
+  // True when CheckPermission is backed by policy (Postgres iam_bindings / role_permissions in metalhostd).
+  bool supports_rbac = 5;
+}
+
+message GetCallerIdentityRequest {}
+
+message GetCallerIdentityResponse {
+  // The authenticated principal, e.g. "users/alice" or "serviceAccounts/bot".
+  string principal = 1;
+  // The default project attached to the bearer token, or empty.
+  string default_project = 2;
+  // When non-empty, the bearer token is hard-scoped to this project — cross-project requests
+  // are rejected by RequireProjectAccess. Empty means the token has no project scope (its
+  // permissions are limited only by the principal's role bindings).
+  string scope_project = 3;
+  // Organizations the caller has an iam_bindings row against (any role). Useful for the
+  // portal landing resolver: when this is non-empty but default_project is empty, the user
+  // has access to ≥1 org but hasn't created/been-assigned a project yet — route them to
+  // the onboarding wizard. Empty list means the user has no org access at all (orphan
+  // account; very rare).
+  repeated string accessible_organizations = 4;
+}
+
+message CheckPermissionRequest {
+  // When empty, uses the authenticated principal from the request context (requires API key auth on metalhostd).
+  string principal = 1;
+  // Permission id, e.g. admin.platform or admin.catalog.read.
+  string permission = 2;
+  // Resource scope for bindings, e.g. //metalhost/platform. Empty defaults to //metalhost/platform.
+  string resource_name = 3;
+}
+
+message CheckPermissionResponse {
+  bool allowed = 1;
+}
+
+message ValidateOidcTokenRequest {
+  // Bearer token without the "Bearer " prefix, or full Authorization header contents.
+  string access_token = 1;
+}
+
+message ValidateOidcTokenResponse {
+  string principal = 1;
+  string default_project = 2;
+  map<string, string> claims = 3;
+}
+
+// ApiKey describes a key without exposing the secret. Used in ListApiKeys and as the metadata
+// half of CreateApiKey's response (the secret half is on CreateApiKeyResponse.secret).
+message ApiKey {
+  // Resource name `api-keys/<sha256-hex>` (AIP-122 canonical form). The slug after the prefix
+  // is the SHA-256 hex of the key — use this with RevokeApiKey.
+  string name = 10;
+  reserved 1;
+  reserved "id";
+  // Owner principal (always the caller for keys minted via IamService).
+  string principal = 2;
+  // Default project the key authorises requests against when no explicit project is given.
+  string default_project = 3;
+  // Caller-supplied label for UX (e.g. "ci-bot-prod"). Not validated for uniqueness.
+  string display_name = 4;
+  // First few characters of the secret — convenient for matching when revoking. Never the full
+  // secret.
+  string key_prefix = 5;
+  int64 create_time_unix = 6;
+  // 0 when the key never expires.
+  int64 expires_at_unix = 7;
+  // 0 when the key is still active.
+  int64 revoked_at_unix = 8;
+  // When non-empty, the key is HARD-SCOPED to this project. Requests targeting other projects
+  // (or org-level resources) are rejected with PermissionDenied regardless of the principal's
+  // bindings. Use this for least-privilege keys (CI bots, app integrations). Empty means the
+  // key inherits the full set of the principal's bindings — `default_project` above is just a
+  // UX fallback, not a scope.
+  string scope_project = 9;
+}
+
+message CreateApiKeyRequest {
+  // Optional label, e.g. "laptop" or "ci-bot". Echoed back; not validated for uniqueness.
+  string display_name = 1;
+  // Project the key targets when no explicit project is supplied on a request. Empty falls
+  // back to the caller's existing default_project. The caller must have access to this project.
+  string default_project = 2;
+  // When true, the key is hard-scoped to `default_project` — every request authenticated by
+  // this key is rejected with PermissionDenied unless it targets that project. Cross-project
+  // and org-level access are blocked even for principals that hold admin.organization or
+  // admin.platform. Use this for CI bots / app integrations that should never reach beyond
+  // their tenant project. The resulting key's `ApiKey.scope_project` field is set to the same
+  // value as `default_project`. Default false (key inherits the principal's full bindings).
+  bool project_scoped = 3;
+}
+
+message CreateApiKeyResponse {
+  ApiKey api_key = 1;
+  // The plaintext secret. Returned ONCE — store it immediately. Subsequent ListApiKeys calls
+  // expose only metadata.
+  string secret = 2;
+}
+
+message ListApiKeysRequest {
+  int32 page_size = 1;
+  string page_token = 2;
+}
+
+message ListApiKeysResponse {
+  repeated ApiKey api_keys = 1;
+  string next_page_token = 2;
+}
+
+message RevokeApiKeyRequest {
+  // The id from ListApiKeys / CreateApiKey responses.
+  string name = 1;  // Resource name api-keys/<id> (renamed from id in proto audit)
+}
+
+message RevokeApiKeyResponse {}
+
+message SignUpRequest {
+  // Human-readable name for the tenant (becomes the org's display name). Required.
+  // Customer-facing wording: "Company / organization name".
+  string display_name = 1;
+  // Email address. Required. Used to derive the principal slug and as the account's contact
+  // address. When `password` is supplied, the server sends a Resend verification email and
+  // returns SignUpResponse.verification_pending=true (no API key yet); the caller then calls
+  // VerifyEmail with the token from the email. When `password` is empty, the legacy
+  // closed-beta path runs (gated by METALHOST_ENABLE_PUBLIC_SIGNUP) and immediately mints the
+  // API key — used by dev / staging / OIDC-only signups that don't store a password.
+  string email = 2;
+  // Optional plaintext password. Length must be ≥ 8. Empty string falls through to the legacy
+  // closed-beta path (no verification, no password stored).
+  string password = 3;
+  // Full name of the signing-up user (becomes users.display_name). Optional; when empty the
+  // server falls back to display_name (the company / org name). Surfacing this separately
+  // lets the portal greet the user by their name ("Welcome back, Alice") instead of their
+  // company name. Portal sign-up form should collect both.
+  string full_name = 4;
+}
+
+message SignUpResponse {
+  // The created organization (`organizations/{slug}`). Empty when verification_pending=true.
+  string organization_name = 1;
+  // The default project under the new org (`projects/{slug}-default`). Empty when pending.
+  string project_name = 2;
+  // The principal id (`users/{slug}`) that owns the new tenancy. Empty when pending.
+  string principal = 3;
+  // The minted API key + plaintext secret. Same one-shot semantics as CreateApiKey — the
+  // secret is never retrievable again after this response. Nil when verification_pending=true.
+  ApiKey api_key = 4;
+  string secret = 5;
+  // True when the server sent a verification email and is waiting for VerifyEmail. The
+  // organization / user / API key fields above are empty in this case.
+  bool verification_pending = 6;
+}
+
+message VerifyEmailRequest {
+  // The token from the verification email link.
+  string token = 1;
+}
+
+message VerifyEmailResponse {
+  string organization_name = 1;
+  string project_name = 2;
+  string principal = 3;
+  ApiKey api_key = 4;
+  string secret = 5;
+}
+
+message LoginRequest {
+  string email = 1;
+  string password = 2;
+}
+
+message LoginResponse {
+  string principal = 1;
+  ApiKey api_key = 2;
+  string secret = 3;
+}
+
+message LinkOidcProviderRequest {
+  // OIDC provider to link (`oidc-providers/{slug}`).
+  string provider_name = 1;
+  // Where the provider should redirect after the user authorizes.
+  string redirect_uri = 2;
+}
+
+message LinkOidcProviderResponse {
+  string authorize_url = 1;
+  string state = 2;
+}
+
+message InviteOrgMemberRequest {
+  // Org the invite is for (`organizations/{slug}`). Caller must hold admin.organization on it.
+  string organization_name = 1;
+  // Email of the invitee. Used to derive the principal slug at AcceptInvite time.
+  string email = 2;
+  // Role assigned at accept time. v1 ships only "viewer" / "editor" / "admin"; admin is
+  // equivalent to admin.organization on the org. Other strings rejected.
+  string role = 3;
+  // Optional human display name pre-fill (the invitee can override at accept).
+  string display_name = 4;
+}
+
+message InviteOrgMemberResponse {
+  // Opaque token the invitee redeems via AcceptInvite. Bearer-only — anyone with the token
+  // can accept. Operators forward via email out-of-band; expires in 7 days.
+  string accept_token = 1;
+  int64 expires_at_unix = 2;
+}
+
+message AcceptInviteRequest {
+  string accept_token = 1;
+}
+
+message SetInitialPasswordRequest {
+  // New password. Same minimum-length rules as SignUp/ResetPassword.
+  string new_password = 1;
+}
+
+message SetInitialPasswordResponse {}
+
+message AcceptInviteResponse {
+  string organization_name = 1;
+  string principal = 2;
+  ApiKey api_key = 3;
+  string secret = 4;
+  // True when the accepted user has no password set AND no linked OIDC identity, meaning
+  // the only way back into the account today is the now-consumed invite token. The SPA
+  // forces a credential-setup step (SetInitialPassword or LinkOidcProvider) before sending
+  // the user to the dashboard. Existing users get false here.
+  bool needs_credentials = 5;
+}
+
+message ListOrgMembersRequest {
+  string organization_name = 1;
+  int32 page_size = 2;
+  string page_token = 3;
+}
+
+message OrgMember {
+  string principal = 1;
+  string role = 2;
+  string email = 3;
+  string display_name = 4;
+  int64 joined_at_unix = 5;
+  // True when the user has at least one VERIFIED MFA device. Surfaced by GetOrgMember; the
+  // bulk ListOrgMembers leaves this unset (we don't want to pay the per-row MFA query on
+  // every list call).
+  bool mfa_enrolled = 6;
+  // Most recent auth_sessions.last_used_at across this user's sessions, or 0 when none.
+  // Surfaced by GetOrgMember; unset on ListOrgMembers for the same reason as mfa_enrolled.
+  int64 last_seen_unix = 7;
+}
+
+message ListOrgMembersResponse {
+  repeated OrgMember org_members = 1;
+  string next_page_token = 2;
+}
+
+message RemoveOrgMemberRequest {
+  string organization_name = 1;
+  string principal = 2;
+}
+
+message RemoveOrgMemberResponse {}
+
+message UpdateOrgMemberRoleRequest {
+  // organizations/<slug>.
+  string organization_name = 1;
+  // Resource name of the user (`users/<slug>`).
+  string principal = 2;
+  // Same role names as InviteOrgMember: viewer / editor / admin.
+  string role = 3;
+}
+
+message UpdateOrgMemberRoleResponse {
+  OrgMember member = 1;
+}
+
+// PendingInvite is the unaccepted-invite shape surfaced to org admins. accept_token is
+// intentionally omitted — the original recipient of InviteOrgMember has it; the list view
+// is for resend (re-invite) + revoke, not token disclosure.
+message PendingInvite {
+  string id = 1;
+  string organization_name = 2;
+  string email = 3;
+  // Customer-facing role label (admin / editor / viewer).
+  string role = 4;
+  string display_name = 5;
+  // Resource name of the org admin who issued the invite.
+  string inviter_principal = 6;
+  int64 expires_at_unix = 7;
+  int64 create_time_unix = 8;
+}
+
+message ListPendingInvitesRequest {
+  string organization_name = 1;
+  int32 page_size = 2;
+  string page_token = 3;
+}
+
+message ListPendingInvitesResponse {
+  repeated PendingInvite invites = 1;
+  string next_page_token = 2;
+}
+
+message RevokeInviteRequest {
+  string organization_name = 1;
+  // The invite id from ListPendingInvites.
+  string invite_id = 2;
+}
+
+message RevokeInviteResponse {}
+
+message RotateApiKeyRequest {
+  // The key prefix (first ~12 chars of the original secret) of the key being rotated.
+  string key_prefix = 1;
+  // Optional override for the new key's display name; defaults to the rotated key's name.
+  string display_name = 2;
+}
+
+message RotateApiKeyResponse {
+  ApiKey new_api_key = 1;
+  string new_secret = 2;
+  // The prefix of the key that was revoked.
+  string revoked_key_prefix = 3;
+}
+
+message StartOidcLoginRequest {
+  // Provider name (`oidc-providers/{slug}`) — admins register these via AdminIamService.
+  string provider_name = 1;
+  // Where the IdP should redirect after auth — typically the gateway's /oauth/callback.
+  string redirect_uri = 2;
+}
+
+message StartOidcLoginResponse {
+  // Browser navigates here. Metalhost-generated state token is embedded; gateway preserves it
+  // through to CompleteOidcLogin so we can validate replay.
+  string authorize_url = 1;
+  string state = 2;
+}
+
+message CompleteOidcLoginRequest {
+  string provider_name = 1;
+  // Authorization code from the IdP redirect.
+  string code = 2;
+  // Echo of the state we issued in StartOidcLogin.
+  string state = 3;
+  string redirect_uri = 4;
+}
+
+message CompleteOidcLoginResponse {
+  string principal = 1;
+  ApiKey api_key = 2;
+  string secret = 3;
+}
+
+// MFA / TOTP messages. The shared secret + provisioning URI are returned ONCE on enroll — the
+// caller's authenticator app should consume them immediately. Subsequent reads of the
+// credential (ListMFADevices) only expose `secret_prefix` for identification.
+
+message MFADevice {
+  // Resource name `mfa-devices/<id>`.
+  string name = 8;
+  reserved 1;
+  reserved "id";
+  string display_name = 2;
+  string type = 3;          // "totp" — only TOTP in v1.
+  string state = 4;         // PENDING | ACTIVE
+  string secret_prefix = 5; // First 6 chars of the secret, for the user to identify devices.
+  int64 enrolled_at_unix = 6;
+  int64 last_used_at_unix = 7;
+}
+
+message EnrollMFARequest {
+  string display_name = 1; // Optional — e.g. "iPhone 15".
+}
+
+message EnrollMFAResponse {
+  MFADevice device = 1;
+  // Cleartext shared secret. Returned exactly once, not stored anywhere the caller can read
+  // again — they must enter it (or scan the QR) into their authenticator app NOW.
+  string secret = 2;
+  // Provisioning URI: `otpauth://totp/{Issuer}:{Account}?secret=...&issuer={Issuer}` — most
+  // authenticator apps render this as a QR code.
+  string provisioning_uri = 3;
+}
+
+message VerifyMFAEnrollmentRequest {
+  string name = 1;  // Resource name mfa-devices/<id> (renamed from device_id in proto audit)
+  // 6-digit TOTP code from the authenticator app.
+  string totp_code = 2;
+}
+
+message VerifyMFAEnrollmentResponse {
+  MFADevice device = 1;
+  // One-shot recovery codes. Returned exactly once on first successful verification — store
+  // these somewhere safe; each can be used once if the authenticator is lost.
+  repeated string recovery_codes = 2;
+}
+
+message ListMFADevicesRequest {}
+
+message ListMFADevicesResponse {
+  repeated MFADevice mfa_devices = 1;
+}
+
+message RevokeMFADeviceRequest {
+  string name = 1;  // Resource name mfa-devices/<id> (renamed from device_id in proto audit)
+}
+
+message RevokeMFADeviceResponse {}
+
+// Session management messages.
+
+message Session {
+  // Resource name `sessions/<id>`.
+  string name = 11;
+  reserved 1;
+  reserved "id";
+  string principal = 2;
+  string source = 3;       // "oidc" | "signup" | "invite-accept" | "manual"
+  string ip_address = 4;
+  string user_agent = 5;
+  // Last 6 chars of the SHA-256 of the API key this session is bound to. Doesn't expose the
+  // key but lets the user correlate "current session" by matching the prefix shown in their
+  // CLI / browser.
+  string key_fingerprint = 6;
+  int64 create_time_unix = 7;
+  int64 last_used_at_unix = 8;
+  int64 expires_at_unix = 9;
+  bool is_current = 10; // True for the session the caller is using right now.
+}
+
+message ListSessionsRequest {}
+
+message ListSessionsResponse {
+  repeated Session sessions = 1;
+}
+
+message RevokeSessionRequest {
+  string name = 1;  // Resource name sessions/<id> (renamed from session_id in proto audit)
+}
+
+message RevokeSessionResponse {}
+
+message RevokeAllOtherSessionsRequest {}
+
+message RevokeAllOtherSessionsResponse {
+  // Number of sessions revoked (excludes the calling session).
+  int32 revoked_count = 1;
+}
+
+// User is the profile shape returned by GetUser / UpdateUser. Read-only on most fields; only
+// display_name is mutable via UpdateUser. Email changes go through RequestEmailChange.
+message User {
+  string name = 1;
+  string email = 2;
+  string display_name = 3;
+  // ACTIVE / DISABLED / LOCKED — same vocabulary as the users table state column.
+  string state = 4;
+  // True when the user has at least one VERIFIED MFA device. Tells the UI whether to show
+  // the "Enable MFA" prompt or the "Manage MFA" link.
+  bool mfa_enrolled = 5;
+  // True when password_hash is non-empty (user can log in with email + password). False for
+  // OIDC-only signups.
+  bool password_set = 6;
+  int64 create_time_unix = 7;
+}
+
+message RequestPasswordResetRequest {
+  string email = 1;
+}
+
+message RequestPasswordResetResponse {
+  // Always true. The RPC never reveals whether the email matched a user — that would be an
+  // account-enumeration oracle. Caller's UX: "If that email is on file, we've sent a reset
+  // link."
+  bool ok = 1;
+}
+
+message ResetPasswordRequest {
+  // Token from the reset email (plaintext; server hashes it for lookup).
+  string token = 1;
+  string new_password = 2;
+}
+
+message ResetPasswordResponse {
+  // The principal whose password was reset, so the UI can show "Reset successful — sign in
+  // as alice@example.com".
+  string principal = 1;
+}
+
+message GetUserRequest {
+  // Empty name means "the caller". Non-empty fetches a specific user (permission required).
+  string name = 1;
+}
+
+message GetUserResponse {
+  User user = 1;
+}
+
+message UpdateUserRequest {
+  string name = 1;
+  // Only the supplied optional fields are updated. Other fields are preserved.
+  optional string display_name = 2;
+}
+
+message UpdateUserResponse {
+  User user = 1;
+}
+
+message ChangePasswordRequest {
+  string current_password = 1;
+  string new_password = 2;
+}
+
+message ChangePasswordResponse {}
+
+message RequestEmailChangeRequest {
+  // New email address. Must be a valid email + not already in use by another active user.
+  string new_email = 1;
+}
+
+message RequestEmailChangeResponse {}
+
+message LogoutRequest {}
+
+message LogoutResponse {}
+
+message GetOrgMemberRequest {
+  // organizations/<slug>
+  string organization_name = 1;
+  // users/<slug>
+  string principal = 2;
+}
+
+message GetOrgMemberResponse {
+  OrgMember member = 1;
+}
+
+// ImportGitHubSshKeys onboarding shortcut. Fetches https://github.com/<github_username>.keys
+// (public endpoint, no auth) and bulk-creates SSHKey rows under the named project. Duplicates
+// (by fingerprint) are skipped; the response lists keys actually created.
+message ImportGitHubSshKeysRequest {
+  // Project under which to create the keys, e.g. "projects/acme-prod".
+  string project_name = 1;
+  // GitHub login (not numeric id). Required — even when the caller is OIDC-linked to GitHub,
+  // we don't currently persist the username and the client must pass it. If the caller wants
+  // us to look it up from a linked OIDC identity, set `use_linked_identity=true` and leave
+  // github_username empty.
+  string github_username = 2;
+  // When true, the server resolves the GitHub username from the caller's linked oidc_identities
+  // row (provider_name='github'). Returns FailedPrecondition if no linked identity exists.
+  bool use_linked_identity = 3;
+  // Optional display-name prefix for created keys; defaults to "github-<username>-<n>" when
+  // empty.
+  string display_name_prefix = 4;
+}
+
+message ImportGitHubSshKeysResponse {
+  // Newly-created SSHKey resource names (e.g. "projects/acme-prod/ssh-keys/<uuid>").
+  repeated string created_ssh_key_names = 1;
+  // Number of keys returned by GitHub that were skipped because the same fingerprint already
+  // exists under the project (we never duplicate keys).
+  int32 skipped_existing = 2;
+}
+
+message SetSessionDefaultProjectRequest {
+  // Resource name `projects/<slug>`. Must be one the caller has access to (we check via
+  // RequireProjectRead). Empty string clears the default (sets api_keys.default_project
+  // to NULL) — useful for "leave project" actions where the user no longer has access.
+  string project_name = 1;
+}
+
+message SetSessionDefaultProjectResponse {
+  // Echoes back what was set (or empty if cleared) so the client can update its cached
+  // identity without a follow-up GetCallerIdentity call.
+  string project_name = 1;
+}
+
+// ListNotifications: customer-notable subset of the org audit feed (see ActivityEvent
+// .notify_in_app). Joined to notification_reads so the response includes read state per row.
+// Server enforces a 30-day window.
+message ListNotificationsRequest {
+  // organizations/<slug>. When empty, defaults to the caller's primary org.
+  string organization_name = 1;
+  int32 page_size = 2;
+  string page_token = 3;
+  // When true, only return unread notifications. Otherwise all notifications in the 30-day
+  // window are returned with their read state.
+  bool unread_only = 4;
+}
+
+message Notification {
+  // The underlying audit event id; reuse it as the key when calling MarkNotificationsRead.
+  string id = 1;
+  int64 timestamp_unix = 2;
+  string actor = 3;
+  // Humanized summary, same string ListOrgActivity produces.
+  string summary = 4;
+  string resource_name = 5;
+  // SUCCESS / FAILURE / WARNING.
+  string outcome = 6;
+  // Whether the calling user has marked this notification as read.
+  bool read = 7;
+  // When `read=true`, the unix timestamp the user marked it.
+  int64 read_at_unix = 8;
+}
+
+message ListNotificationsResponse {
+  repeated Notification notifications = 1;
+  string next_page_token = 2;
+  // Total unread count across the 30-day window — drives the bell-icon badge.
+  int32 unread_count = 3;
+}
+
+message MarkNotificationsReadRequest {
+  // organizations/<slug>. When empty, defaults to caller's primary org. Used so a malicious
+  // caller can't mark someone else's org's notifications "read" by guessing event ids.
+  string organization_name = 1;
+  // Specific notification (= audit event) ids to mark read. Ignored when mark_all=true.
+  repeated string notification_ids = 2;
+  // When true, marks every visible notification in the 30-day window read for this caller.
+  // Convenience for the "Mark all as read" button on the bell-icon dropdown.
+  bool mark_all = 3;
+}
+
+message MarkNotificationsReadResponse {
+  int32 marked_count = 1;
+}

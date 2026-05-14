@@ -1,0 +1,18 @@
+syntax = "proto3";
+
+package aes.health.v1;
+
+// Liveness/readiness for load balancers and ops.
+service HealthService {
+  rpc Check(CheckRequest) returns (CheckResponse);
+}
+
+message CheckRequest {}
+
+message CheckResponse {
+  string status = 1;
+  // Server build version (e.g. "0.0.1-rc235"). Empty when the binary was built without
+  // ldflags injection — defaults to "dev" in that case. SPA renders it in the footer so
+  // operators can confirm which backend tag is running.
+  string version = 2;
+}

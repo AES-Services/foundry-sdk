@@ -1,0 +1,69 @@
+syntax = "proto3";
+
+package aes.audit.v1;
+
+// AuditService records security-relevant events (design §4 audit-svc).
+//
+// Customer-facing surface is read-only — SearchEvents only. LogEvent is intentionally
+// not routed as an RPC: it stays a Go method on services/audit.Server (and the
+// pkg/auditdb helper of the same name) called by backend services that write audit
+// entries on the customer's behalf. Exposing the write side would let any caller
+// inject fake audit entries against any principal/resource — a real auditability hole.
+service AuditService {
+  rpc SearchEvents(SearchEventsRequest) returns (SearchEventsResponse);
+}
+
+message AuditEvent {
+  string id = 1;
+  int64 timestamp_unix = 2;
+  string action = 3;
+  string principal = 4;
+  // Resource the event is about, e.g. `virtual-machines/<uuid>`. Renamed from `resource` to
+  // match the platform `*_name` convention (proto audit pass).
+  string resource_name = 5;
+  map<string, string> metadata = 6;
+  string request_id = 7;
+  string trace_id = 8;
+  string organization_name = 9;
+  string project_name = 10;
+  string severity = 11;
+}
+
+message LogEventRequest {
+  string action = 1;
+  string principal = 2;
+  string resource_name = 3;
+  map<string, string> metadata = 4;
+  string request_id = 5;
+  string trace_id = 6;
+  string organization_name = 7;
+  string project_name = 8;
+  string severity = 9;
+}
+
+message LogEventResponse {
+  AuditEvent event = 1;
+}
+
+message SearchEventsRequest {
+  int32 page_size = 1;
+  // Opaque cursor from SearchEventsResponse.next_page_token.
+  string page_token = 2;
+  // If set, action must have this prefix (SQL LIKE prefix match).
+  string action_prefix = 3;
+  string principal_prefix = 4;
+  // Project filter (`projects/{slug}`). Customer callers must set either this OR
+  // organization_name; platform admins may omit both for fleet-wide queries (B34).
+  string project_name = 5;
+  // Minimum event time (inclusive), Unix seconds; 0 = no lower bound.
+  int64 min_timestamp_unix = 6;
+  // Organization filter (`organizations/{slug}`). Use for billing / org-scoped audit
+  // queries that don't belong to a single project (e.g. wallet.topup.succeeded). Caller
+  // must hold a project binding under the org or admin.organization on it.
+  string organization_name = 7;
+}
+
+message SearchEventsResponse {
+  repeated AuditEvent events = 1;
+  string next_page_token = 2;
+}

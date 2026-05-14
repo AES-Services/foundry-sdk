@@ -1,0 +1,172 @@
+syntax = "proto3";
+
+package aes.project.v1;
+
+// ProjectService is the tenancy slice of the control plane (design §4 project-svc).
+//
+// Removed surfaces (folded into AdminProjectService or dropped entirely):
+//   - ListOrganizations: every customer has exactly one org; multi-org switcher is v2.
+//   - TransferProject / TransferResources: per-org isolation is the v1 product invariant.
+//   - Folders (List/Get/Create/Update/Delete): nesting was a v2 idea, nothing used it.
+//   - GetDashboardSummary: SPA builds its own tile aggregation via parallel queries.
+//   - RecoverProject / RecoverOrganization: moved to AdminProjectService (operator-only).
+service ProjectService {
+  rpc GetOrganization(GetOrganizationRequest) returns (GetOrganizationResponse);
+  rpc CreateOrganization(CreateOrganizationRequest) returns (CreateOrganizationResponse);
+  rpc UpdateOrganization(UpdateOrganizationRequest) returns (UpdateOrganizationResponse);
+  // DeleteOrganization soft-deletes the org. Fails when the org still has projects/billing
+  // accounts under it — clean those up first.
+  rpc DeleteOrganization(DeleteOrganizationRequest) returns (DeleteOrganizationResponse);
+  rpc ListProjects(ListProjectsRequest) returns (ListProjectsResponse);
+  rpc GetProject(GetProjectRequest) returns (GetProjectResponse);
+  rpc CreateProject(CreateProjectRequest) returns (CreateProjectResponse);
+  rpc UpdateProject(UpdateProjectRequest) returns (UpdateProjectResponse);
+  // DeleteProject soft-deletes the project. Cascading FKs on compute_instances / tenant_networks /
+  // service_accounts wipe project resources via ON DELETE CASCADE; usage_events keep the project_name
+  // as history (FK is ON DELETE SET NULL).
+  rpc DeleteProject(DeleteProjectRequest) returns (DeleteProjectResponse);
+
+  // ListOrgActivity returns a humanized stream of recent events across the org — VM created,
+  // disk resized, payment processed, firewall rule added, etc. Backed by audit_events but
+  // filtered + reshaped for end-user consumption (raw audit log lives at admin's
+  // ListAuditEvents). Sorted newest-first.
+  rpc ListOrgActivity(ListOrgActivityRequest) returns (ListOrgActivityResponse);
+}
+
+message Organization {
+  // Resource name, e.g. `organizations/my-org`.
+  string name = 1;
+  string display_name = 2;
+}
+
+message GetOrganizationRequest {
+  string name = 1;
+}
+
+message GetOrganizationResponse {
+  Organization organization = 1;
+}
+
+message Project {
+  // Resource name, e.g. `projects/my-project`.
+  string name = 1;
+  string display_name = 2;
+  // Parent organization resource name, e.g. `organizations/my-org`.
+  string parent = 3;
+  // (field 4 reserved — previously folder when folder nesting was supported)
+  reserved 4;
+  reserved "folder";
+  // (field 5 reserved — previously preferred_wallet_name when multi-wallet was supported)
+  reserved 5;
+  reserved "preferred_wallet_name";
+  // Seconds since unix epoch when the projects row was inserted. 0 only for legacy rows
+  // pre-dating this field — fresh creates always populate it.
+  int64 create_time_unix = 6;
+}
+
+message ListProjectsRequest {
+  int32 page_size = 1;
+  string page_token = 2;
+  // When set, list only projects with this parent organization.
+  string parent = 3;
+}
+
+message ListProjectsResponse {
+  repeated Project projects = 1;
+  string next_page_token = 2;
+}
+
+message GetProjectRequest {
+  string name = 1;
+}
+
+message GetProjectResponse {
+  Project project = 1;
+}
+
+// Org CRUD.
+
+message CreateOrganizationRequest {
+  // Resource name, e.g. `organizations/acme`.
+  string name = 1;
+  string display_name = 2;
+}
+
+message CreateOrganizationResponse {
+  Organization organization = 1;
+}
+
+message UpdateOrganizationRequest {
+  string name = 1;
+  optional string display_name = 2;
+}
+
+message UpdateOrganizationResponse {
+  Organization organization = 1;
+}
+
+message DeleteOrganizationRequest {
+  string name = 1;
+}
+
+message DeleteOrganizationResponse {}
+
+// Project CRUD.
+
+message CreateProjectRequest {
+  // Resource name, e.g. `projects/acme-prod`.
+  string name = 1;
+  string display_name = 2;
+  // Parent organization `organizations/{org}`. Must exist.
+  string parent = 3;
+}
+
+message CreateProjectResponse {
+  Project project = 1;
+}
+
+message UpdateProjectRequest {
+  string name = 1;
+  optional string display_name = 2;
+}
+
+message UpdateProjectResponse {
+  Project project = 1;
+}
+
+message DeleteProjectRequest {
+  string name = 1;
+}
+
+message DeleteProjectResponse {}
+
+message ListOrgActivityRequest {
+  string organization_name = 1;
+  int32 page_size = 2;
+  string page_token = 3;
+}
+
+message ListOrgActivityResponse {
+  repeated ActivityEvent events = 1;
+  string next_page_token = 2;
+}
+
+message ActivityEvent {
+  string id = 1;
+  int64 timestamp_unix = 2;
+  // Actor principal (users/alice, serviceAccounts/bot, etc.).
+  string actor = 3;
+  // Humanized action label, e.g. "Created VM web-01" or "Refunded $10.00 top-up".
+  string summary = 4;
+  // Resource the action touched (e.g. virtual-machines/...).
+  string resource_name = 5;
+  // SUCCESS / FAILURE / WARNING.
+  string outcome = 6;
+  // When true, this event is customer-notable and should appear in the portal's bell-icon
+  // notification feed (top-up succeeded, VM operation completed, spending alert triggered,
+  // member invite accepted, billing account suspended, etc.). When false, it's still a real
+  // audit row visible in Settings > Activity log, but isn't loud enough for the bell.
+  // The classification is server-side (see services/project/dashboard.go notifyInApp()) so
+  // the policy can evolve without a frontend redeploy.
+  bool notify_in_app = 7;
+}

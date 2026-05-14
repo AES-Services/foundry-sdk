@@ -1,0 +1,179 @@
+syntax = "proto3";
+
+package aes.support.v1;
+
+import "google/protobuf/timestamp.proto";
+
+// SupportService is the customer-facing ticket API. Tickets are organization-scoped — every
+// member of the org can see every ticket the org has opened. Staff-side management (assign,
+// escalate, internal notes, cross-org list) lives in aes.admin.v1.AdminSupportService.
+//
+// v1 is API + DB only. Email gateway, Slack relay, and SLA breach worker land in phase 2;
+// the schema already carries channel + sla_due_at so phase 2 is pure business logic.
+service SupportService {
+  // CreateTicket opens a new ticket and posts the initial customer message.
+  rpc CreateTicket(CreateTicketRequest) returns (CreateTicketResponse);
+  // ListTickets returns tickets owned by the caller's organization. Closed tickets are
+  // excluded by default; pass status_filter=TICKET_STATUS_CLOSED to see them.
+  rpc ListTickets(ListTicketsRequest) returns (ListTicketsResponse);
+  // GetTicket returns the ticket and its message thread. internal_note messages are
+  // filtered out for non-staff callers.
+  rpc GetTicket(GetTicketRequest) returns (GetTicketResponse);
+  // ReplyTicket appends a customer message and transitions status to PENDING_STAFF when the
+  // ticket was previously PENDING_CUSTOMER. No-op transition otherwise.
+  rpc ReplyTicket(ReplyTicketRequest) returns (ReplyTicketResponse);
+  // CloseTicket transitions the ticket to CLOSED. Customer can close from any non-CLOSED
+  // status; staff-side resolution uses AdminSupportService.ResolveTicket which records a
+  // resolution note.
+  rpc CloseTicket(CloseTicketRequest) returns (CloseTicketResponse);
+}
+
+// Lifecycle states. PENDING_CUSTOMER means staff replied and we're waiting on the user;
+// PENDING_STAFF means the user replied and we owe them a response. RESOLVED is set by staff
+// (AdminSupportService.ResolveTicket); CLOSED is the terminal state — set when the customer
+// confirms or auto-closes after an inactivity window. Customer-side CloseTicket goes
+// directly to CLOSED.
+enum TicketStatus {
+  TICKET_STATUS_UNSPECIFIED = 0;
+  TICKET_STATUS_OPEN = 1;
+  TICKET_STATUS_PENDING_CUSTOMER = 2;
+  TICKET_STATUS_PENDING_STAFF = 3;
+  TICKET_STATUS_RESOLVED = 4;
+  TICKET_STATUS_CLOSED = 5;
+}
+
+enum TicketPriority {
+  TICKET_PRIORITY_UNSPECIFIED = 0;
+  TICKET_PRIORITY_LOW = 1;
+  TICKET_PRIORITY_NORMAL = 2;
+  TICKET_PRIORITY_HIGH = 3;
+  TICKET_PRIORITY_URGENT = 4;
+}
+
+enum TicketCategory {
+  TICKET_CATEGORY_UNSPECIFIED = 0;
+  TICKET_CATEGORY_GENERAL = 1;
+  TICKET_CATEGORY_TECHNICAL = 2;
+  TICKET_CATEGORY_BILLING = 3;
+  TICKET_CATEGORY_ABUSE = 4;
+  TICKET_CATEGORY_FEATURE = 5;
+}
+
+// Channel records how the ticket was originally opened. v1 only ever sets API; EMAIL and
+// SYSTEM (auto-opened on incident detection) are reserved for phase 2.
+enum TicketChannel {
+  TICKET_CHANNEL_UNSPECIFIED = 0;
+  TICKET_CHANNEL_API = 1;
+  TICKET_CHANNEL_EMAIL = 2;
+  TICKET_CHANNEL_SYSTEM = 3;
+}
+
+// ResourceRef attaches an arbitrary platform resource to a ticket — useful for staff
+// triage. Free-form to avoid coupling support to every other service's ID format.
+message ResourceRef {
+  // Domain identifier: "vm" | "bare_metal" | "network" | "volume" | "billing_account" | ...
+  string type = 1;
+  // Resource ID inside its domain (UUID, name, etc.).
+  string id = 2;
+  // Optional human label rendered next to the ID for staff context.
+  string display = 3;
+}
+
+message Ticket {
+  // Resource name `tickets/<uuid>` (AIP-122 canonical form). The slug after the prefix is
+  // the bare UUID.
+  string name = 17;
+  reserved 1;
+  reserved "id";
+  string organization_name = 2;
+  // User principal that opened the ticket.
+  string opened_by = 3;
+  string subject = 4;
+  TicketStatus status = 5;
+  TicketPriority priority = 6;
+  TicketCategory category = 7;
+  TicketChannel channel = 8;
+  repeated ResourceRef resource_refs = 9;
+  // Assigned staff user (admin RPC sets this). Empty when unassigned.
+  string assignee = 10;
+  google.protobuf.Timestamp created_at = 11;
+  google.protobuf.Timestamp updated_at = 12;
+  google.protobuf.Timestamp last_activity_at = 13;
+  google.protobuf.Timestamp resolved_at = 14;
+  // Set on creation per plan tier; null = no SLA. Phase 2 worker sweeps for breach.
+  google.protobuf.Timestamp sla_due_at = 15;
+  google.protobuf.Timestamp escalated_at = 16;
+}
+
+message TicketMessage {
+  string id = 1;
+  string ticket_id = 2;
+  // "customer" | "staff" | "system"
+  string author_type = 3;
+  string author_id = 4;
+  string body = 5;
+  // True when the message is staff-only. Filtered out by GetTicket for non-staff callers.
+  bool internal_note = 6;
+  google.protobuf.Timestamp created_at = 7;
+}
+
+message CreateTicketRequest {
+  string organization_name = 1;
+  string subject = 2;
+  // Body of the initial customer message.
+  string body = 3;
+  TicketCategory category = 4;
+  // Optional. Defaults to TICKET_PRIORITY_NORMAL when unspecified.
+  TicketPriority priority = 5;
+  repeated ResourceRef resource_refs = 6;
+}
+
+message CreateTicketResponse {
+  Ticket ticket = 1;
+  TicketMessage initial_message = 2;
+}
+
+message ListTicketsRequest {
+  string organization_name = 1;
+  // When unspecified, returns all non-CLOSED tickets. Pass an explicit status to filter.
+  TicketStatus status_filter = 2;
+  // Pagination. Server caps page_size to 100; page_token is opaque.
+  int32 page_size = 3;
+  string page_token = 4;
+}
+
+message ListTicketsResponse {
+  repeated Ticket tickets = 1;
+  string next_page_token = 2;
+}
+
+message GetTicketRequest {
+  string name = 1;  // Resource name tickets/<id> (renamed from ticket_id in proto audit)
+}
+
+message GetTicketResponse {
+  Ticket ticket = 1;
+  // Thread ordered oldest-first. internal_note messages excluded for non-staff callers.
+  repeated TicketMessage messages = 2;
+}
+
+message ReplyTicketRequest {
+  string name = 1;  // Resource name tickets/<id> (renamed from ticket_id in proto audit)
+  string body = 2;
+}
+
+message ReplyTicketResponse {
+  TicketMessage message = 1;
+  // Updated ticket (status may have transitioned to PENDING_STAFF).
+  Ticket ticket = 2;
+}
+
+message CloseTicketRequest {
+  string name = 1;  // Resource name tickets/<id> (renamed from ticket_id in proto audit)
+  // Optional final customer-side message recorded before close.
+  string body = 2;
+}
+
+message CloseTicketResponse {
+  Ticket ticket = 1;
+}

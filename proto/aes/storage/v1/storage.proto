@@ -1,0 +1,234 @@
+syntax = "proto3";
+
+package aes.storage.v1;
+
+// StorageService manages persistent block disks: standalone PVCs that customers create up
+// front, attach to VMs (potentially hot-plug at runtime), and reuse across VM lifetimes. The
+// boot disk inside CreateVirtualMachine is a separate concern (it lives only as long as the VM
+// does); this service is for data disks the customer wants to keep.
+//
+// Storage class is presented to the customer as a friendly tier name — currently `nvme` only.
+// Metalhost translates that per-datacenter to the actual k8s StorageClass via DC annotation
+// `aes.metalhost/storage-class-nvme`. Lab DCs may map it to `local-path`; production DCs map
+// to a Rook RBD tier. (`ssd` was reserved for a future SATA-SSD tier and is rejected today.)
+service StorageService {
+  rpc CreateDisk(CreateDiskRequest) returns (CreateDiskResponse);
+  rpc GetDisk(GetDiskRequest) returns (GetDiskResponse);
+  rpc ListDisks(ListDisksRequest) returns (ListDisksResponse);
+  rpc UpdateDisk(UpdateDiskRequest) returns (UpdateDiskResponse);
+  rpc DeleteDisk(DeleteDiskRequest) returns (DeleteDiskResponse);
+  // AttachDisk hot-plugs the disk into the named VM via the KubeVirt addvolume subresource.
+  // The disk must be AVAILABLE (not already attached); the VM must be RUNNING.
+  rpc AttachDisk(AttachDiskRequest) returns (AttachDiskResponse);
+  // DetachDisk hot-unplugs via removevolume. The disk returns to AVAILABLE; the VM keeps running.
+  rpc DetachDisk(DetachDiskRequest) returns (DetachDiskResponse);
+  // ResizeDisk grows the underlying PVC. Online-resize per CSI spec — the volume expansion
+  // happens without unmounting; for attached disks, the guest sees the new size after a
+  // filesystem-level resize (xfs_growfs / resize2fs). Shrinking is not supported (PVC expansion
+  // is one-way at the CSI level).
+  rpc ResizeDisk(ResizeDiskRequest) returns (ResizeDiskResponse);
+
+  // File shares — RWX NFS volumes (CephFS-backed, exported via Ganesha) that multiple VMs in
+  // the same tenant network can mount concurrently. The per-share Ganesha export ACL
+  // whitelists the tenant network CIDR, so any VM on that network can `mount -t nfs4` using
+  // the FileShare's `mount_command`. No attach/detach bookkeeping — the customer mounts in-guest.
+  rpc CreateFileShare(CreateFileShareRequest) returns (CreateFileShareResponse);
+  rpc ListFileShares(ListFileSharesRequest) returns (ListFileSharesResponse);
+  rpc DeleteFileShare(DeleteFileShareRequest) returns (DeleteFileShareResponse);
+}
+
+// Disk is a persistent block volume backed by a PVC in the datacenter cluster's metalhost-vms
+// namespace. State machine:
+//   PROVISIONING → AVAILABLE → ATTACHED → AVAILABLE (on detach) → DELETING → DELETED
+// Attached disks cannot be deleted — detach first.
+message Disk {
+  // Resource name `projects/{project}/disks/{id}`.
+  string name = 1;
+  string display_name = 2;
+  string project_name = 3;
+  string datacenter_name = 4;
+  int32 size_gib = 5;
+  // Customer-facing storage tier — currently `nvme` only. Translated per-DC to a real k8s
+  // StorageClass at PVC create time — see the DC's `aes.metalhost/storage-class-nvme` annotation.
+  string storage_class = 6;
+  // PROVISIONING / AVAILABLE / ATTACHED / DELETING / DELETED.
+  string state = 7;
+  // VM the disk is currently attached to (`virtual-machines/{id}`); empty when AVAILABLE.
+  string attached_vm = 8;
+  int64 create_time_unix = 9;
+  int64 update_time_unix = 10;
+  map<string, string> labels = 11;
+  map<string, string> annotations = 12;
+  // Tenant Network the disk's PVC lives in (`projects/{p}/networks/{id}`). Disks are
+  // namespace-scoped because KubeVirt only mounts PVCs in the same k8s namespace as the VM.
+  // Set at create time; immutable. Disks can only attach to VMs on the same Network.
+  string network_name = 13;
+}
+
+message CreateDiskRequest {
+  // The project the disk belongs to (`projects/{id}`).
+  string project_name = 1;
+  // The datacenter the disk lives in (`datacenters/{id}`). Disks are DC-local — they cannot move
+  // between DCs and can only attach to VMs in the same DC.
+  string datacenter_name = 2;
+  // 1..1024 GiB. Lift the upper bound via project quota when needed.
+  int32 size_gib = 3;
+  // `nvme` (currently the only tier offered). Required when from_image_url is empty.
+  string storage_class = 4;
+  string display_name = 5;
+  map<string, string> labels = 6;
+  map<string, string> annotations = 7;
+  reserved 8;
+  reserved "from_snapshot";
+  // Tenant Network the disk attaches to (`projects/{p}/networks/{id}`). When empty, the
+  // project's default Network is used (auto-created on first VM/disk in the project + DC).
+  // Disks can only attach to VMs on the same Network because KubeVirt requires same-namespace
+  // PVC mounts.
+  string network_name = 9;
+  // Optional: hydrate the new disk from a streamable raw disk image URL (e.g. an Ubuntu cloud
+  // image). CDI's http source writes the image byte-for-byte into the PVC during PROVISIONING;
+  // the disk transitions to AVAILABLE once import completes. The disk is billed from the
+  // moment it lands in AVAILABLE/ATTACHED state — the meter loop skips PROVISIONING so
+  // customers don't pay during CDI hydration.
+  string from_image_url = 10;
+}
+
+message CreateDiskResponse {
+  Disk disk = 1;
+}
+
+message GetDiskRequest {
+  string name = 1;
+}
+
+message GetDiskResponse {
+  Disk disk = 1;
+}
+
+message ListDisksRequest {
+  string project_name = 1;
+  int32 page_size = 2;
+  string page_token = 3;
+}
+
+message ListDisksResponse {
+  repeated Disk disks = 1;
+  string next_page_token = 2;
+}
+
+message UpdateDiskRequest {
+  string name = 1;
+  optional string display_name = 2;
+  // Merge-by-default; set clear_labels=true to fully replace.
+  map<string, string> labels = 3;
+  bool clear_labels = 4;
+  map<string, string> annotations = 5;
+  bool clear_annotations = 6;
+}
+
+message UpdateDiskResponse {
+  Disk disk = 1;
+}
+
+message DeleteDiskRequest {
+  string name = 1;
+}
+
+message DeleteDiskResponse {}
+
+message AttachDiskRequest {
+  string disk_name = 1;
+  // The VM to attach to (`virtual-machines/{id}`). Must be in the same project + datacenter.
+  string vm_name = 2;
+}
+
+message AttachDiskResponse {
+  Disk disk = 1;
+}
+
+message DetachDiskRequest {
+  string disk_name = 1;
+}
+
+message DetachDiskResponse {
+  Disk disk = 1;
+}
+
+message ResizeDiskRequest {
+  string disk_name = 1;
+  // New target size. Must be strictly greater than current size (PVC expansion is one-way).
+  int32 new_size_gib = 2;
+}
+
+message ResizeDiskResponse {
+  Disk disk = 1;
+}
+
+// -----------------------------------------------------------------------------
+// FileShare messages — RWX shared filesystem volumes (CephFS, NFSv4 via Ganesha).
+// -----------------------------------------------------------------------------
+
+message FileShare {
+  // Resource name `projects/{project}/file-shares/{slug}`.
+  string name = 1;
+  string project_name = 2;
+  string datacenter_name = 3;
+  int32 size_gib = 4;
+  // PROVISIONING / AVAILABLE / DELETING / DELETED.
+  string state = 5;
+  // Storage tier alias (e.g. "cephfs-rwx"). Today only "cephfs-rwx" is offered; the value
+  // identifies which DC NFS gateway to use, not a k8s StorageClass.
+  string storage_class = 6;
+  reserved 7;
+  reserved "attached_vms";
+  string display_name = 8;
+  map<string, string> labels = 9;
+  map<string, string> annotations = 10;
+  int64 create_time_unix = 11;
+  int64 update_time_unix = 12;
+  // NFS server endpoint customers mount over (host[:port]). Same address for every share in
+  // a DC — one Ganesha gateway exposes many exports. Allocated from the DC's
+  // public-ipv4-pool, advertised via MetalLB.
+  string nfs_server_endpoint = 13;
+  // Pseudo path inside the NFS export namespace. Per-share UUID — knowing the path is
+  // necessary but not sufficient for access (Ganesha's per-export ACL whitelists the
+  // tenant network CIDR; mounts from outside that CIDR get permission denied).
+  string nfs_export_path = 14;
+  // Convenience: the full mount command for a Linux guest. e.g.
+  // `mount -t nfs4 10.50.0.135:/projects/<uuid>/<uuid> /mnt/share`. Customers paste this
+  // into cloud-init or run by hand — any VM on the tenant network is allowed by the
+  // Ganesha export ACL.
+  string mount_command = 15;
+}
+
+message CreateFileShareRequest {
+  string project_name = 1;
+  string datacenter_name = 2;
+  int32 size_gib = 3;
+  // Storage tier alias. Defaults to "cephfs-rwx" when empty.
+  string storage_class = 4;
+  string display_name = 5;
+  map<string, string> labels = 6;
+  map<string, string> annotations = 7;
+}
+
+message CreateFileShareResponse {
+  FileShare file_share = 1;
+}
+
+message ListFileSharesRequest {
+  string project_name = 1;
+  int32 page_size = 2;
+  string page_token = 3;
+}
+
+message ListFileSharesResponse {
+  repeated FileShare file_shares = 1;
+  string next_page_token = 2;
+}
+
+message DeleteFileShareRequest {
+  string name = 1;
+}
+
+message DeleteFileShareResponse {}

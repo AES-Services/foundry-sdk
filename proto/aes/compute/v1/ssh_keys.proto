@@ -1,0 +1,68 @@
+syntax = "proto3";
+
+package aes.compute.v1;
+
+// SSHKeysService manages reusable SSH keys at the project level. Keys registered here can be
+// referenced by name from CreateVirtualMachineRequest.ssh_key_names without pasting the
+// pubkey on every VM. Keys are project-scoped — sharing across projects requires re-registering.
+//
+// Pre-launch surface is the minimum needed by the SPA: Create / List / Delete. Single-key
+// Get + rename (Update) are intentionally absent — list returns everything the UI needs,
+// and customers who want to rename a key can delete + re-add. UserDataSnippetsService was
+// removed entirely; customers paste cloud-init YAML directly on the VM create form.
+service SSHKeysService {
+  rpc CreateSSHKey(CreateSSHKeyRequest) returns (CreateSSHKeyResponse);
+  rpc ListSSHKeys(ListSSHKeysRequest) returns (ListSSHKeysResponse);
+  rpc DeleteSSHKey(DeleteSSHKeyRequest) returns (DeleteSSHKeyResponse);
+}
+
+message SSHKey {
+  // Resource name `projects/{project}/ssh-keys/{slug}`.
+  string name = 1;
+  string display_name = 2;
+  string project_name = 3;
+  // OpenSSH-format public key (one line: "ssh-ed25519 AAAA... user@host"). Validated for
+  // syntax (algorithm + base64) on Create.
+  string public_key = 4;
+  // Algorithm extracted from public_key — "ssh-ed25519" / "ssh-rsa" / "ecdsa-sha2-nistp256".
+  string algorithm = 5;
+  // SHA-256 fingerprint shown in the dashboard for visual identification ("SHA256:abc...").
+  string fingerprint = 6;
+  int64 create_time_unix = 7;
+  int64 update_time_unix = 8;
+  map<string, string> labels = 9;
+  map<string, string> annotations = 10;
+}
+
+message CreateSSHKeyRequest {
+  string project_name = 1;  // Full resource name `projects/{slug}` (B38). Slug-only is also accepted.
+  // DNS-safe slug. Resource name becomes `projects/{project_name}/ssh-keys/{ssh_key_id}`.
+  string ssh_key_id = 2;
+  string display_name = 3;
+  // OpenSSH single-line format. Trailing comment optional.
+  string public_key = 4;
+  map<string, string> labels = 5;
+  map<string, string> annotations = 6;
+  string idempotency_key = 7;
+}
+
+message CreateSSHKeyResponse {
+  SSHKey ssh_key = 1;
+}
+
+message ListSSHKeysRequest {
+  string project_name = 1;  // Full resource name `projects/{slug}` (B38). Slug-only is also accepted.
+  int32 page_size = 2;
+  string page_token = 3;
+}
+
+message ListSSHKeysResponse {
+  repeated SSHKey ssh_keys = 1;
+  string next_page_token = 2;
+}
+
+message DeleteSSHKeyRequest {
+  string name = 1;
+}
+
+message DeleteSSHKeyResponse {}

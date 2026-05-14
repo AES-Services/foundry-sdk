@@ -1,0 +1,38 @@
+syntax = "proto3";
+
+package aes.quota.v1;
+
+// QuotaService is the customer-facing read API for quotas. AdminQuotaService (in aes.admin.v1)
+// remains the management surface — admins set limits, customers see effective caps.
+//
+// Pre-launch surface is read-only — quota-increase requests go through the support ticket
+// flow (SupportService.CreateTicket) rather than a parallel quota-request workflow. The
+// previous Request/ListQuotaIncreaseRequests RPCs were removed along with their tickets table.
+//
+// Effective limit semantics: when both an org-level and project-level quota row exist for the
+// same key, the effective ceiling is min(org, project). Missing rows = unlimited (closed-beta
+// default).
+service QuotaService {
+  rpc GetMyQuotas(GetMyQuotasRequest) returns (GetMyQuotasResponse);
+}
+
+message ProjectQuotaUsage {
+  string quota_key = 1;
+  // -1 = unlimited (no row in either project_quotas or org_quotas).
+  int64 effective_limit = 2;
+  // Current consumption — count of in-use resources for *.count keys, or running total for
+  // hour-based keys. -1 when consumption is not tracked yet for the key.
+  int64 current_usage = 3;
+  // Source of the limiting row: "project" | "org" | "unlimited".
+  string limit_source = 4;
+}
+
+message GetMyQuotasRequest {
+  string project_name = 1;
+}
+
+message GetMyQuotasResponse {
+  string project_name = 1;
+  string organization_name = 2;
+  repeated ProjectQuotaUsage quotas = 3;
+}

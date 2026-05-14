@@ -1,0 +1,192 @@
+syntax = "proto3";
+
+package aes.catalog.v1;
+
+// CatalogService exposes datacenters and SKUs per PLATFORM_DESIGN.md §4.
+service CatalogService {
+  rpc ListDatacenters(ListDatacentersRequest) returns (ListDatacentersResponse);
+  // GetRegionHealth returns capacity + degraded-component summary for a single DC. Customers
+  // call this before provisioning to avoid landing in a full or sick region.
+  rpc GetRegionHealth(GetRegionHealthRequest) returns (GetRegionHealthResponse);
+  // ListMaintenanceWindows returns scheduled or active maintenance windows across DCs. Tags
+  // affected resource kinds so callers know whether their workloads are at risk.
+  rpc ListMaintenanceWindows(ListMaintenanceWindowsRequest) returns (ListMaintenanceWindowsResponse);
+
+  // ListPricingComponents returns the configurator price catalog: one row per
+  // (component, class, currency). Clients cache the table on configurator load and
+  // recompute prices locally as the user adjusts sliders. Time-versioned; a cached
+  // table stays valid until the next operator price change (rare).
+  rpc ListPricingComponents(ListPricingComponentsRequest) returns (ListPricingComponentsResponse);
+
+  // QuoteVirtualMachine returns the server-authoritative hourly + per-term prices for a
+  // configured VM shape. Frontend uses this on Submit to confirm the price the customer
+  // is committing to (defends against stale cached pricing). Returns ALL four monthly
+  // term lengths in one call so the frontend can render the discount table without four
+  // round-trips. Same shape as the validation done by ChargeMonthlyPrepayment, so a
+  // successful Quote means a subsequent CreateVM at the same shape will charge exactly
+  // the quoted amount.
+  rpc QuoteVirtualMachine(QuoteVirtualMachineRequest) returns (QuoteVirtualMachineResponse);
+}
+
+// Datacenter lifecycle.
+enum DatacenterState {
+  DATACENTER_STATE_UNSPECIFIED = 0;
+  DATACENTER_STATE_PLANNED = 1;
+  DATACENTER_STATE_PROVISIONING = 2;
+  DATACENTER_STATE_READY = 3;
+  DATACENTER_STATE_DEGRADED = 4;
+  DATACENTER_STATE_DEPROVISIONING = 5;
+  DATACENTER_STATE_RETIRED = 6;
+}
+
+message Datacenter {
+  // Resource name, e.g. `datacenters/us-dal-1`.
+  string name = 1;
+  string display_name = 2;
+  DatacenterState state = 3;
+  // Optional inventory / site reference.
+  string site_id = 4;
+  // Kubernetes API endpoint for the DC control plane (operator-visible).
+  string kubernetes_api_endpoint = 5;
+  map<string, string> labels = 6;
+  map<string, string> annotations = 7;
+  string kubernetes_version = 8;
+  string kubevirt_version = 9;
+  // Opaque summary JSON or text for health snapshots (OVN, Rook, etc.).
+  string health_summary = 10;
+  // ────────────── Capacity (populated by ListDatacenters / GetDatacenter) ──────────────
+  // capacity_pct: % of usable VM CPU capacity currently allocated (0..100). Same number
+  // GetRegionHealth returns. Allows the VM-create UI to dim a region or surface a "near
+  // capacity" badge without a second round-trip. 0 means empty (or unmeasurable); 100 means
+  // no more VMs can be scheduled until something stops. Zero when the DC isn't READY/DEGRADED
+  // (e.g. PROVISIONING DCs report 0).
+  int32 capacity_pct = 11;
+}
+
+message ListDatacentersRequest {
+  int32 page_size = 1;
+  string page_token = 2;
+  // Reserved for CEL / simple filters (Phase 0: ignored).
+  string filter = 3;
+}
+
+message ListDatacentersResponse {
+  repeated Datacenter datacenters = 1;
+  string next_page_token = 2;
+}
+
+// RegionHealth is the customer-visible summary of a DC's current state. capacity_pct is the
+// % of compute hosts currently allocated (0..100); status is the DC's `state` mapped to a
+// human-friendly summary; degraded_components lists subsystems with non-OK status.
+message RegionHealth {
+  string datacenter_name = 1;
+  string status = 2;
+  int32 capacity_pct = 3;
+  repeated string degraded_components = 4;
+  string health_summary = 5;
+  int64 last_updated_unix = 6;
+  // VM CPU capacity (k8s_vm pool) using the same oversubscribe ratio as compute admission.
+  double vm_cpu_oversubscribe_ratio = 7;
+  int64 vm_sellable_vcpu = 8;
+  int64 vm_running_vcpu = 9;
+  int64 vm_free_vcpu = 10;
+}
+
+message GetRegionHealthRequest {
+  string datacenter_name = 1;
+}
+
+message GetRegionHealthResponse {
+  RegionHealth health = 1;
+}
+
+message MaintenanceWindow {
+  string name = 1;
+  string datacenter_name = 2;
+  int64 start_time_unix = 3;
+  int64 end_time_unix = 4;
+  string description = 5;
+  // Resource kinds affected: e.g. "compute" / "storage" / "network".
+  repeated string affected_components = 6;
+  // 'SCHEDULED' | 'ACTIVE' | 'COMPLETED' | 'CANCELLED'.
+  string status = 7;
+}
+
+message ListMaintenanceWindowsRequest {
+  // Optional DC filter; empty = all DCs.
+  string datacenter_name = 1;
+  // When true, only windows whose end_time is in the future. Default false (returns history too).
+  bool active_only = 2;
+  int32 page_size = 3;
+  string page_token = 4;
+}
+
+message ListMaintenanceWindowsResponse {
+  repeated MaintenanceWindow maintenance_windows = 1;
+  string next_page_token = 2;
+}
+
+// PricingComponent is one priced unit in the configurator catalog. unit_price_minor is in
+// minor currency units (cents); always quoted alongside currency since the table is
+// keyed (component, class, currency).
+message PricingComponent {
+  string component = 1;          // vcpu | ram_gib | storage_nvme_gib | public_ipv4 | egress_gib
+  string class = 2;              // cascadelake | standard | ...
+  string currency = 3;           // USD
+  // Integer minor units (cents), rounded from the underlying NUMERIC. Kept for backwards
+  // compatibility with anything that scans int64; use unit_price_minor_decimal for the
+  // exact stored rate (configurator rates are sub-cent).
+  int64 unit_price_minor = 4;
+  string display_name = 5;
+  // When the row took effect — caches keyed on (component, class, currency, effective_at)
+  // never need to invalidate prematurely.
+  int64 effective_at_unix = 6;
+  // Exact rate as the server stored it, in NUMERIC text form (e.g. "0.342465"). Same scale
+  // as unit_price_minor (1.0 = 1 cent) but with 6 decimals of sub-cent precision so the
+  // configurator surfaces $2.50/vCPU-month (= 0.000951 cents/sec) without rounding loss.
+  string unit_price_minor_decimal = 7;
+}
+
+message ListPricingComponentsRequest {
+  // Default USD when empty.
+  string currency = 1;
+}
+
+message ListPricingComponentsResponse {
+  repeated PricingComponent components = 1;
+}
+
+message QuoteVirtualMachineRequest {
+  // Same fields as CreateVirtualMachineRequest's configurator slice. Validated under the
+  // same 1–16 GiB-per-vCPU ratio bounds; an out-of-range shape returns InvalidArgument.
+  int32 vcpus = 1;
+  int32 ram_gib = 2;
+  string cpu_class = 3;
+  int32 boot_disk_gib = 4;
+  int32 extra_disk_gib = 5;
+  int32 public_ipv4_count = 6;
+  string currency = 7;           // default USD
+}
+
+message QuoteVirtualMachineResponse {
+  // ROUND-to-int64 view for clients that don't want to parse decimals. For shapes whose
+  // hourly cost is sub-cent (typical for small configurator VMs at $2.50/vCPU-month) this
+  // rounds — use hourly_minor_decimal for the exact NUMERIC.
+  int64 hourly_minor = 1;
+  // Per-term prepayment totals for each MONTHLY_* tier, in minor units. Discount applied:
+  // MONTHLY_1 = 0%, MONTHLY_3 = 5%, MONTHLY_6 = 8%, MONTHLY_12 = 12%. Calculated as
+  // hourly × 730 hours × months × (1 - discount/100), rounded once at the end.
+  int64 monthly_1_minor = 2;
+  int64 monthly_3_minor = 3;
+  int64 monthly_6_minor = 4;
+  int64 monthly_12_minor = 5;
+  string currency = 6;
+  // Exact NUMERIC text values mirroring the int64 fields above (1.0 = 1 cent, 6 decimals
+  // of sub-cent precision). Clients that need to compose further math (display hourly,
+  // pro-rate by elapsed seconds, etc.) should consume these instead of the rounded int64s.
+  string hourly_minor_decimal = 7;
+  string monthly_1_minor_decimal = 8;
+  string monthly_3_minor_decimal = 9;
+  string monthly_6_minor_decimal = 10;
+  string monthly_12_minor_decimal = 11;
+}
